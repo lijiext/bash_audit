@@ -30,7 +30,7 @@ jobs:
 
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Install Build Tools
         run: |
@@ -70,7 +70,7 @@ jobs:
           file bash-src/bash
 
       - name: Upload Audited Bash Binary
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: bash-audited-${{ matrix.arch }}-v${{ github.event.inputs.bash_version || '5.0' }}
           path: bash-src/bash
