@@ -39,7 +39,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        bash_version: ['4.4.18', '5.0', '5.1.16', '5.2.37']
+        bash_version: ['4.4.18', '5.0', '5.1.16', '5.2.37', '5.3']
         distro:
           - { name: "ubuntu-20.04", image: "ubuntu:20.04", pkg_manager: "apt" }
           - { name: "ubuntu-22.04", image: "ubuntu:22.04", pkg_manager: "apt" }
