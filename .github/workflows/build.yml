@@ -1,82 +1,139 @@
 name: Build Audited Bash
 
+# ============================================================
+# Triggers
+# ============================================================
 on:
   push:
-    branches: [ main, master ]
+    branches: [main, master]
+    paths:
+      - 'bash_audit.patch'
+      - 'scripts/build.sh'
+      - '.github/workflows/build.yml'
+  pull_request:
+    branches: [main, master]
   workflow_dispatch:
-    inputs:
-      bash_version:
-        description: 'Bash version to build (e.g., 4.2, 4.4, 5.0, 5.1, 5.2)'
-        required: true
-        default: '5.0'
 
+# ============================================================
+# Security: least-privilege permissions
+# ============================================================
+permissions:
+  contents: read
+
+# ============================================================
+# Concurrency: cancel superseded runs on the same branch
+# ============================================================
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# ============================================================
+# Jobs
+# ============================================================
 jobs:
   build:
+    name: "bash-${{ matrix.bash_version }} / ${{ matrix.distro.name }} / ${{ matrix.arch }}"
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+
     strategy:
       fail-fast: false
       matrix:
-        arch: [x86_64, aarch64, armv7]
-        include:
-          - arch: x86_64
-            toolchain: ""
-            host: ""
-          - arch: aarch64
-            toolchain: "gcc-aarch64-linux-gnu"
-            host: "aarch64-linux-gnu"
-          - arch: armv7
-            toolchain: "gcc-arm-linux-gnueabihf"
-            host: "arm-linux-gnueabihf"
+        bash_version: ['4.4', '5.0', '5.1', '5.2']
+        distro:
+          - { name: "ubuntu-20.04", image: "ubuntu:20.04", pkg_manager: "apt" }
+          - { name: "ubuntu-22.04", image: "ubuntu:22.04", pkg_manager: "apt" }
+          - { name: "ubuntu-24.04", image: "ubuntu:24.04", pkg_manager: "apt" }
+          - { name: "rhel-7",      image: "centos:7",     pkg_manager: "yum" }
+          - { name: "rhel-8",      image: "rockylinux:8", pkg_manager: "dnf" }
+          - { name: "rhel-9",      image: "rockylinux:9", pkg_manager: "dnf" }
+        arch: [x86_64, aarch64]
+        exclude:
+          # CentOS 7 aarch64 altarch repos are unreliable
+          - distro: { name: "rhel-7" }
+            arch: aarch64
 
     steps:
-      - name: Checkout Repository
+      # ---- Checkout ----
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install Build Tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y bison wget build-essential ${{ matrix.toolchain }}
+      # ---- QEMU for cross-arch ----
+      - name: Set up QEMU
+        if: matrix.arch != 'x86_64'
+        uses: docker/setup-qemu-action@v3
 
-      - name: Download Bash Source
-        run: |
-          # 优先使用输入的版本，否则默认 5.0
-          VERSION="${{ github.event.inputs.bash_version }}"
-          if [ -z "$VERSION" ]; then VERSION="5.0"; fi
-          echo "Building Bash version: $VERSION"
-          wget "https://ftp.gnu.org/gnu/bash/bash-${VERSION}.tar.gz"
-          tar -xzf "bash-${VERSION}.tar.gz"
-          mv "bash-${VERSION}" bash-src
+      # ---- Cache bash source tarballs ----
+      - name: Cache bash source tarball
+        uses: actions/cache@v4
+        with:
+          path: cache
+          key: bash-src-${{ matrix.bash_version }}
 
-      - name: Apply Audit Patch
-        run: |
-          cd bash-src
-          # 使用通用源码补丁
-          patch -p0 < ../bash_audit.patch
+      - name: Prepare cache directory
+        run: mkdir -p cache
 
-      - name: Configure and Build
+      # ---- Build inside distro container ----
+      - name: Build audited bash
         run: |
-            cd bash-src
-            # 核心修改：增加 -static 以实现全静态链接，解决 GLIBC 版本不匹配问题
-            export LDFLAGS="-static"
-            export CFLAGS="-O2"
-            
-            # 针对静态编译，建议关闭 bash-malloc 和动态加载支持以提高兼容性
-            CONF_FLAGS="--without-bash-malloc --disable-nls --disable-loadable-builtins"
-            
-            if [ -n "${{ matrix.host }}" ]; then
-              CONF_FLAGS="$CONF_FLAGS --host=${{ matrix.host }}"
-            fi
-            
-            ./configure $CONF_FLAGS
-            make -j$(nproc)
+          PLATFORM="linux/amd64"
+          if [ "${{ matrix.arch }}" = "aarch64" ]; then PLATFORM="linux/arm64"; fi
 
-      - name: Verify Binary
+          docker run --rm --platform "$PLATFORM" \
+            -v "${{ github.workspace }}:/workspace" \
+            -e "BASH_VER=${{ matrix.bash_version }}" \
+            -e "PKG_MGR=${{ matrix.distro.pkg_manager }}" \
+            "${{ matrix.distro.image }}" \
+            /bin/sh /workspace/scripts/build.sh
+
+      # ---- Rename output ----
+      - name: Rename binary
         run: |
-          ls -l bash-src/bash
-          file bash-src/bash
+          ARTIFACT_NAME="bash-${{ matrix.bash_version }}-${{ matrix.distro.name }}-${{ matrix.arch }}"
+          mv bash-output "$ARTIFACT_NAME"
+          echo "ARTIFACT_NAME=$ARTIFACT_NAME" >> "$GITHUB_ENV"
 
-      - name: Upload Audited Bash Binary
+      # ---- Verify ----
+      - name: Verify binary
+        run: |
+          ls -lh "$ARTIFACT_NAME"
+          file "$ARTIFACT_NAME"
+
+      # ---- Upload ----
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: bash-audited-${{ matrix.arch }}-v${{ github.event.inputs.bash_version || '5.0' }}
-          path: bash-src/bash
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ env.ARTIFACT_NAME }}
+          retention-days: 90
+
+      # ---- Job summary ----
+      - name: Add to job summary
+        if: always()
+        run: |
+          echo "### Build: bash-${{ matrix.bash_version }} / ${{ matrix.distro.name }} / ${{ matrix.arch }}" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f "$ARTIFACT_NAME" ]; then
+            SIZE=$(ls -lh "$ARTIFACT_NAME" | awk '{print $5}')
+            echo "✅ **Success** — Binary size: $SIZE" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "❌ **Failed**" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  # ============================================================
+  # Summary job — runs after all builds complete
+  # ============================================================
+  summary:
+    name: Build Summary
+    needs: build
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Report overall status
+        run: |
+          echo "## Audited Bash Build Results" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ needs.build.result }}" = "success" ]; then
+            echo "✅ All builds passed." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "⚠️ Some builds failed. Check individual jobs for details." >> "$GITHUB_STEP_SUMMARY"
+          fi
