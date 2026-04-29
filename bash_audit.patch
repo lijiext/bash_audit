@@ -1,16 +1,6 @@
---- bashhist.h  2018-09-29 18:09:10.000000000 +0000
-+++ bashhist.h  2026-04-29 06:49:48.920020672 +0000
-@@ -79,6 +79,7 @@
- extern char *pre_process_line __P((char *, int, int));
- extern void maybe_add_history __P((char *));
- extern void bash_add_history __P((char *));
-+extern void bash_audit_log __P((char *));
- extern int check_add_history __P((char *, int));
- extern int history_number __P((void));
- 
---- bashhist.c  2018-07-06 02:41:14.000000000 +0000
-+++ bashhist.c  2026-04-29 06:49:48.920020672 +0000
-@@ -38,9 +38,11 @@
+--- bashhist.c	2018-07-06 02:41:14.000000000 +0000
++++ bashhist.c	2026-04-29 13:01:35.997727544 +0000
+@@ -38,9 +38,9 @@
  
  #include "bashintl.h"
  
@@ -18,126 +8,134 @@
 -#  include <syslog.h>
 -#endif
 +#include <syslog.h>
-+#include <pwd.h>
 +#include <time.h>
-+
-+
++#include <fcntl.h>
  
  #include "shell.h"
  #include "flags.h"
-@@ -1037,4 +1039,102 @@
+@@ -1037,4 +1037,125 @@
  
    return match;
  }
-+/* BASH AUDIT: 审计日志记录函数
-+   不依赖 HISTCONTROL 或 HISTIGNORE，确保记录所有交互式命令。
-+   尝试按顺序使用以下目录记录日志：
-+   1. /var/log/bash/
-+   2. root 用户家目录
-+   3. /tmp/
-+   4. /var/tmp/
-+   如果目录不存在则尝试创建，并设置权限。 */
++
++/* BASH AUDIT: 安全审计日志记录函数
++   双通道日志:
++   1. syslog (主通道 - 防篡改，用户无法直接访问)
++   2. 文件 (辅助通道 - 按用户 UID 隔离)
++      目录: /var/log/bash/ 权限 1733 (sticky bit)
++      文件: audit_<uid>.log 权限 0200 (仅追加写入)
++   增强字段用于 su/sudo 追踪:
++   - login_user: 原始登录用户 (通过 getlogin/SUDO_USER 获取)
++   - euid: 有效 UID (检测权限提升)
++   - ppid: 父进程 ID (追踪进程链)
++   - tty: 终端名称 (审计定位) */
 +void
-+bash_audit_log (line)
-+     char *line;
++bash_audit_log (char *line)
 +{
-+  static char *fallback_dirs[] = { "/var/log/bash", NULL, "/tmp", "/var/tmp", NULL };
-+  char log_path[PATH_MAX];
 +  const char *user_name;
-+  struct stat st;
-+  FILE *fp = NULL;
-+  int i;
++  const char *login_name;
++  const char *tty_name;
++  char log_path[PATH_MAX];
++  char *escaped, *p, *q;
 +  time_t now;
-+  char *ts;
++  struct tm *tm_info;
++  char ts[64];
++  int fd;
++  FILE *fp;
++  struct stat st;
 +
 +  if (line == 0 || *line == '\0')
 +    return;
 +
 +  user_name = current_user.user_name ? current_user.user_name : "unknown";
 +
-+  /* 初始化 root 家目录 fallback */
-+  if (fallback_dirs[1] == NULL)
++  /* 获取原始登录用户名 (跨 su/sudo 追踪) */
++  login_name = getlogin ();
++  if (login_name == NULL)
 +    {
-+      struct passwd *root_pw = getpwnam ("root");
-+      if (root_pw && root_pw->pw_dir)
-+        fallback_dirs[1] = savestring (root_pw->pw_dir);
-+      else
-+        fallback_dirs[1] = "/root"; /* 兜底硬编码 */
++      char *sudo_user = getenv ("SUDO_USER");
++      login_name = sudo_user ? sudo_user : user_name;
 +    }
 +
-+  /* 遍历目录尝试记录 */
-+  for (i = 0; fallback_dirs[i]; i++)
++  /* 获取终端名称 */
++  tty_name = ttyname (STDIN_FILENO);
++  if (tty_name == NULL)
++    tty_name = "unknown";
++
++  /* 生成 ISO 8601 时间戳 */
++  now = time (NULL);
++  tm_info = localtime (&now);
++  if (tm_info)
++    strftime (ts, sizeof (ts), "%Y-%m-%dT%H:%M:%S%z", tm_info);
++  else
++    snprintf (ts, sizeof (ts), "unknown");
++
++  /* JSON 转义与单行化处理 */
++  escaped = (char *)xmalloc (strlen (line) * 2 + 1);
++  for (p = line, q = escaped; *p; p++)
 +    {
-+      /* 检查并尝试创建目录 */
-+      if (stat (fallback_dirs[i], &st) != 0)
-+        {
-+          if (mkdir (fallback_dirs[i], 0700) != 0)
-+            continue;
-+          /* 如果是 root 创建的，确保权限 700 */
-+          if (getuid () == 0)
-+            chmod (fallback_dirs[i], 0700);
-+        }
-+      else if (!S_ISDIR (st.st_mode))
-+        {
-+          continue;
-+        }
-+
-+      /* 尝试打开日志文件 */
-+      snprintf (log_path, sizeof (log_path), "%s/audit.log", fallback_dirs[i]);
-+      fp = fopen (log_path, "a");
-+      if (fp)
-+        break;
++      if (*p == '"') { *q++ = '\\'; *q++ = '"'; }
++      else if (*p == '\\') { *q++ = '\\'; *q++ = '\\'; }
++      else if (*p == '\n' || *p == '\r' || *p == '\t') { *q++ = ' '; }
++      else if (*p < 32) { *q++ = '?'; }
++      else { *q++ = *p; }
 +    }
++  *q = '\0';
 +
-+  if (fp)
-+    {
-+      char *escaped, *p, *q;
-+      now = time (NULL);
-+      ts = ctime (&now);
-+      if (ts)
-+        ts[strlen (ts) - 1] = '\0'; /* 移除 ctime 自动添加的换行符 */
++  /* 通道 1: syslog (主通道 - 防篡改) */
++  openlog ("bash-audit", LOG_PID | LOG_NDELAY, LOG_LOCAL6);
++  syslog (LOG_INFO,
++    "AUDIT: {\"user\":\"%s\", \"uid\":%d, \"euid\":%d, "
++    "\"login_user\":\"%s\", \"pid\":%d, \"ppid\":%d, "
++    "\"tty\":\"%s\", \"cmd\":\"%s\"}",
++    user_name, (int)current_user.uid, (int)geteuid (),
++    login_name, (int)getpid (), (int)getppid (),
++    tty_name, escaped);
++  closelog ();
 +
-+      /* JSON 转义与单行化处理 */
-+      escaped = (char *)xmalloc (strlen (line) * 2 + 1);
-+      for (p = line, q = escaped; *p; p++)
-+        {
-+          if (*p == '\"') { *q++ = '\\'; *q++ = '\"'; }
-+          else if (*p == '\\') { *q++ = '\\'; *q++ = '\\'; }
-+          else if (*p == '\n' || *p == '\r' || *p == '\t') { *q++ = ' '; }
-+          else if (*p < 32) { *q++ = '?'; } /* 过滤不可见控制字符 */
-+          else { *q++ = *p; }
-+        }
-+      *q = '\0';
++  /* 通道 2: 文件 (辅助通道 - 按用户 UID 隔离) */
++  {
++    const char *log_dir = "/var/log/bash";
 +
-+      /* 写入 JSON 格式日志 */
-+      fprintf (fp, "{\"time\":\"%s\", \"user\":\"%s\", \"uid\":%d, \"pid\":%d, \"cmd\":\"%s\"}\n",
-+               ts ? ts : "unknown", user_name, (int)current_user.uid, (int)getpid (), escaped);
-+      fflush (fp);
-+      fclose (fp);
++    /* 尝试创建目录 (权限 1733: sticky + 仅写入/执行) */
++    if (stat (log_dir, &st) != 0)
++      {
++        if (mkdir (log_dir, 01733) == 0)
++          {
++            if (getuid () == 0)
++              {
++                chmod (log_dir, 01733);
++                chown (log_dir, 0, 0);
++              }
++          }
++      }
 +
-+      /* 同时保留 syslog 记录作为冗余 */
-+      openlog ("bash-audit", LOG_PID, LOG_LOCAL6);
-+      syslog (LOG_LOCAL6|LOG_INFO, "AUDIT: {\"user\":\"%s\", \"uid\":%d, \"pid\":%d, \"cmd\":\"%s\"}",
-+              user_name, (int)current_user.uid, (int)getpid (), escaped);
-+      closelog ();
++    /* 按 UID 隔离: audit_<uid>.log */
++    snprintf (log_path, sizeof (log_path), "%s/audit_%d.log",
++              log_dir, (int)getuid ());
 +
-+      free (escaped);
-+    }
++    /* O_WRONLY|O_APPEND|O_CREAT: 仅追加写入, 权限 0200 (仅写) */
++    fd = open (log_path, O_WRONLY | O_APPEND | O_CREAT, 0200);
++    if (fd >= 0)
++      {
++        fp = fdopen (fd, "a");
++        if (fp)
++          {
++            fprintf (fp,
++              "{\"time\":\"%s\", \"user\":\"%s\", \"uid\":%d, "
++              "\"euid\":%d, \"login_user\":\"%s\", \"pid\":%d, "
++              "\"ppid\":%d, \"tty\":\"%s\", \"cmd\":\"%s\"}\n",
++              ts, user_name, (int)current_user.uid, (int)geteuid (),
++              login_name, (int)getpid (), (int)getppid (),
++              tty_name, escaped);
++            fclose (fp);
++          }
++        else
++          close (fd);
++      }
++  }
++
++  free (escaped);
 +}
 +
-+
  #endif /* HISTORY */
-+
---- parse.y     2019-01-02 18:57:34.000000000 +0000
-+++ parse.y     2026-04-29 06:53:42.799137349 +0000
-@@ -2421,6 +2421,10 @@
-       set_line_mbstate ();
- 
- #if defined (HISTORY)
-+      /* BASH AUDIT: 仅记录从 stdin (tty) 输入的顶级命令，过滤掉 internal strings/sourced files 以减少噪音 */
-+      if (interactive && bash_input.type == st_stdin && shell_input_line && shell_input_line[0] && shell_input_line[0] != '\n')
-+       bash_audit_log (shell_input_line);
-+
-       if (remember_on_history && shell_input_line && shell_input_line[0])
-        {
-          char *expansions;
