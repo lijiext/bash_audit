@@ -48,7 +48,7 @@ cd "bash-${BASH_VER}"
 # ============================================================
 # 3. Apply audit patch
 # ============================================================
-patch -p0 --fuzz=3 < /workspace/bash_audit_final.patch
+patch -p0 --fuzz=3 < /workspace/bash_audit.patch
 
 # ============================================================
 # 4. Configure and build
