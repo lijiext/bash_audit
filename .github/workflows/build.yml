@@ -53,22 +53,22 @@ jobs:
           # 使用通用源码补丁
           patch -p0 < ../bash_audit.patch
 
-     - name: Configure and Build
+      - name: Configure and Build
         run: |
-          cd bash-src
-          # 核心修改：增加 -static 以实现全静态链接，解决 GLIBC 版本不匹配问题
-          export LDFLAGS="-static"
-          export CFLAGS="-O2"
-          
-          # 针对静态编译，建议关闭 bash-malloc 和动态加载支持以提高兼容性
-          CONF_FLAGS="--without-bash-malloc --disable-nls --disable-loadable-builtins"
-          
-          if [ -n "${{ matrix.host }}" ]; then
-            CONF_FLAGS="$CONF_FLAGS --host=${{ matrix.host }}"
-          fi
-          
-          ./configure $CONF_FLAGS
-          make -j$(nproc)
+            cd bash-src
+            # 核心修改：增加 -static 以实现全静态链接，解决 GLIBC 版本不匹配问题
+            export LDFLAGS="-static"
+            export CFLAGS="-O2"
+            
+            # 针对静态编译，建议关闭 bash-malloc 和动态加载支持以提高兼容性
+            CONF_FLAGS="--without-bash-malloc --disable-nls --disable-loadable-builtins"
+            
+            if [ -n "${{ matrix.host }}" ]; then
+              CONF_FLAGS="$CONF_FLAGS --host=${{ matrix.host }}"
+            fi
+            
+            ./configure $CONF_FLAGS
+            make -j$(nproc)
 
       - name: Verify Binary
         run: |
