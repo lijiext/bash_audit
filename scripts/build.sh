@@ -10,10 +10,11 @@ set -ex
 # ============================================================
 if [ "$PKG_MGR" = "apt" ]; then
   export DEBIAN_FRONTEND=noninteractive
-  # Handle EOL Ubuntu repos
   . /etc/os-release 2>/dev/null || true
   case "$VERSION_ID" in
-    18.04|20.04)
+    # Only truly EOL releases need old-releases redirect
+    # 20.04 is still in ESM (until 2030), repos stay on archive.ubuntu.com
+    18.04)
       sed -i 's/archive.ubuntu.com/old-releases.ubuntu.com/g' /etc/apt/sources.list
       sed -i 's/security.ubuntu.com/old-releases.ubuntu.com/g' /etc/apt/sources.list
       ;;
@@ -22,12 +23,15 @@ if [ "$PKG_MGR" = "apt" ]; then
   apt-get install -y --no-install-recommends wget ca-certificates build-essential bison patch file
 
 elif [ "$PKG_MGR" = "yum" ]; then
-  # Handle CentOS 7 EOL repos
+  # CentOS 7 EOL: switch to vault
   sed -i 's/mirrorlist/#mirrorlist/g' /etc/yum.repos.d/CentOS-*.repo 2>/dev/null || true
   sed -i 's|#baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|g' /etc/yum.repos.d/CentOS-*.repo 2>/dev/null || true
   yum install -y wget gcc make bison patch file diffutils
 
 elif [ "$PKG_MGR" = "dnf" ]; then
+  # Clean stale metadata from Docker image cache, then retry on mirror failures
+  dnf clean all
+  dnf makecache --refresh || dnf makecache --refresh
   dnf install -y wget gcc make bison patch file diffutils
 fi
 
