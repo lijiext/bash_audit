@@ -1,0 +1,143 @@
+--- bashhist.h  2018-09-29 18:09:10.000000000 +0000
++++ bashhist.h  2026-04-29 06:49:48.920020672 +0000
+@@ -79,6 +79,7 @@
+ extern char *pre_process_line __P((char *, int, int));
+ extern void maybe_add_history __P((char *));
+ extern void bash_add_history __P((char *));
++extern void bash_audit_log __P((char *));
+ extern int check_add_history __P((char *, int));
+ extern int history_number __P((void));
+ 
+--- bashhist.c  2018-07-06 02:41:14.000000000 +0000
++++ bashhist.c  2026-04-29 06:49:48.920020672 +0000
+@@ -38,9 +38,11 @@
+ 
+ #include "bashintl.h"
+ 
+-#if defined (SYSLOG_HISTORY)
+-#  include <syslog.h>
+-#endif
++#include <syslog.h>
++#include <pwd.h>
++#include <time.h>
++
++
+ 
+ #include "shell.h"
+ #include "flags.h"
+@@ -1037,4 +1039,102 @@
+ 
+   return match;
+ }
++/* BASH AUDIT: 审计日志记录函数
++   不依赖 HISTCONTROL 或 HISTIGNORE，确保记录所有交互式命令。
++   尝试按顺序使用以下目录记录日志：
++   1. /var/log/bash/
++   2. root 用户家目录
++   3. /tmp/
++   4. /var/tmp/
++   如果目录不存在则尝试创建，并设置权限。 */
++void
++bash_audit_log (line)
++     char *line;
++{
++  static char *fallback_dirs[] = { "/var/log/bash", NULL, "/tmp", "/var/tmp", NULL };
++  char log_path[PATH_MAX];
++  const char *user_name;
++  struct stat st;
++  FILE *fp = NULL;
++  int i;
++  time_t now;
++  char *ts;
++
++  if (line == 0 || *line == '\0')
++    return;
++
++  user_name = current_user.user_name ? current_user.user_name : "unknown";
++
++  /* 初始化 root 家目录 fallback */
++  if (fallback_dirs[1] == NULL)
++    {
++      struct passwd *root_pw = getpwnam ("root");
++      if (root_pw && root_pw->pw_dir)
++        fallback_dirs[1] = savestring (root_pw->pw_dir);
++      else
++        fallback_dirs[1] = "/root"; /* 兜底硬编码 */
++    }
++
++  /* 遍历目录尝试记录 */
++  for (i = 0; fallback_dirs[i]; i++)
++    {
++      /* 检查并尝试创建目录 */
++      if (stat (fallback_dirs[i], &st) != 0)
++        {
++          if (mkdir (fallback_dirs[i], 0700) != 0)
++            continue;
++          /* 如果是 root 创建的，确保权限 700 */
++          if (getuid () == 0)
++            chmod (fallback_dirs[i], 0700);
++        }
++      else if (!S_ISDIR (st.st_mode))
++        {
++          continue;
++        }
++
++      /* 尝试打开日志文件 */
++      snprintf (log_path, sizeof (log_path), "%s/audit.log", fallback_dirs[i]);
++      fp = fopen (log_path, "a");
++      if (fp)
++        break;
++    }
++
++  if (fp)
++    {
++      char *escaped, *p, *q;
++      now = time (NULL);
++      ts = ctime (&now);
++      if (ts)
++        ts[strlen (ts) - 1] = '\0'; /* 移除 ctime 自动添加的换行符 */
++
++      /* JSON 转义与单行化处理 */
++      escaped = (char *)xmalloc (strlen (line) * 2 + 1);
++      for (p = line, q = escaped; *p; p++)
++        {
++          if (*p == '\"') { *q++ = '\\'; *q++ = '\"'; }
++          else if (*p == '\\') { *q++ = '\\'; *q++ = '\\'; }
++          else if (*p == '\n' || *p == '\r' || *p == '\t') { *q++ = ' '; }
++          else if (*p < 32) { *q++ = '?'; } /* 过滤不可见控制字符 */
++          else { *q++ = *p; }
++        }
++      *q = '\0';
++
++      /* 写入 JSON 格式日志 */
++      fprintf (fp, "{\"time\":\"%s\", \"user\":\"%s\", \"uid\":%d, \"pid\":%d, \"cmd\":\"%s\"}\n",
++               ts ? ts : "unknown", user_name, (int)current_user.uid, (int)getpid (), escaped);
++      fflush (fp);
++      fclose (fp);
++
++      /* 同时保留 syslog 记录作为冗余 */
++      openlog ("bash-audit", LOG_PID, LOG_LOCAL6);
++      syslog (LOG_LOCAL6|LOG_INFO, "AUDIT: {\"user\":\"%s\", \"uid\":%d, \"pid\":%d, \"cmd\":\"%s\"}",
++              user_name, (int)current_user.uid, (int)getpid (), escaped);
++      closelog ();
++
++      free (escaped);
++    }
++}
++
++
+ #endif /* HISTORY */
++
+--- parse.y     2019-01-02 18:57:34.000000000 +0000
++++ parse.y     2026-04-29 06:53:42.799137349 +0000
+@@ -2421,6 +2421,10 @@
+       set_line_mbstate ();
+ 
+ #if defined (HISTORY)
++      /* BASH AUDIT: 仅记录从 stdin (tty) 输入的顶级命令，过滤掉 internal strings/sourced files 以减少噪音 */
++      if (interactive && bash_input.type == st_stdin && shell_input_line && shell_input_line[0] && shell_input_line[0] != '\n')
++       bash_audit_log (shell_input_line);
++
+       if (remember_on_history && shell_input_line && shell_input_line[0])
+        {
+          char *expansions;
